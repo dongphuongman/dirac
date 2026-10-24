@@ -53,14 +53,14 @@ function isSameOrNestedWorktreePath(worktreePath: string, candidatePath: string)
 	return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative)
 }
 
-/** Return sourceSessionId's worktree record when candidatePath equals or is nested inside it, undefined otherwise. */
+/** Find the managed worktree containing candidatePath, including one retained by another fork after source integration. */
 export function resolveSharedSessionWorktree(sourceSessionId: string, candidatePath: string): SessionWorktree | undefined {
 	const worktrees = readSessionWorktrees()
 	const sourceWorktree = worktrees[sourceSessionId]
 	if (sourceWorktree && isSameOrNestedWorktreePath(sourceWorktree.worktreePath, candidatePath)) {
 		return sourceWorktree
 	}
-	return undefined
+	return Object.values(worktrees).find((worktree) => isSameOrNestedWorktreePath(worktree.worktreePath, candidatePath))
 }
 
 /** Return every session ID that currently owns the given worktree path. */

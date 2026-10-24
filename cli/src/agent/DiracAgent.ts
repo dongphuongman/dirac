@@ -302,7 +302,7 @@ export class DiracAgent implements acp.Agent {
 		return worktree
 	}
 
-	/** Merge a session-owned worktree branch into its requested target branch. */
+	/** Merge a session-owned worktree branch, serializing ownership changes with fork and deletion. */
 	async integrateSessionWorktree(
 		sessionId: string,
 		targetBranch?: string,
@@ -312,52 +312,54 @@ export class DiracAgent implements acp.Agent {
 		targetBranch: string
 		worktreePath: string
 	}> {
-		const worktree = getSessionWorktree(sessionId)
-		if (!worktree) {
-			throw new Error(`Session ${sessionId} has no Dirac-provisioned worktree`)
-		}
-
-		for (const ownerSessionId of getWorktreeOwnerSessionIds(worktree.worktreePath)) {
-			const activeSession = this.sessions.get(ownerSessionId)
-			const activeController = activeSession ? this.#sessionControllers.get(activeSession) : undefined
-			if (activeController?.task) {
-				throw new Error(`Cannot integrate ACP session ${sessionId} while its task is active; close the session first`)
+		return withTaskHistoryInventoryLock(async () => {
+			const worktree = getSessionWorktree(sessionId)
+			if (!worktree) {
+				throw new Error(`Session ${sessionId} has no Dirac-provisioned worktree`)
 			}
-		}
 
-		const branch = targetBranch ?? worktree.targetBranch
-		if (!branch) {
-			throw new Error("targetBranch is required when the session was created from a detached HEAD")
-		}
-
-		const targetGit = simpleGit(worktree.sourceCwd)
-		const checkedOutBranch = (await targetGit.revparse(["--abbrev-ref", "HEAD"])).trim()
-		if (checkedOutBranch !== branch) {
-			throw new Error(`Target branch ${branch} is not checked out at ${worktree.sourceCwd}`)
-		}
-		if (!(await targetGit.status()).isClean()) {
-			throw new Error(`Target branch ${branch} has uncommitted changes`)
-		}
-
-		const worktreeGit = simpleGit(worktree.worktreePath)
-		if (!(await worktreeGit.status()).isClean()) {
-			throw new Error("Session worktree has uncommitted changes; commit or stash them before integrating")
-		}
-
-		await targetGit.merge([worktree.branch, "--no-edit"])
-		if (deleteAfterMerge) {
-			if (!hasOtherSessionWorktreeOwners(sessionId, worktree.worktreePath)) {
-				await targetGit.raw(["worktree", "remove", "--force", worktree.worktreePath])
-				await targetGit.deleteLocalBranch(worktree.branch)
+			for (const ownerSessionId of getWorktreeOwnerSessionIds(worktree.worktreePath)) {
+				const activeSession = this.sessions.get(ownerSessionId)
+				const activeController = activeSession ? this.#sessionControllers.get(activeSession) : undefined
+				if (activeController?.task) {
+					throw new Error(`Cannot integrate ACP session ${sessionId} while its task is active; close the session first`)
+				}
 			}
-			deleteSessionWorktree(sessionId)
-		}
 
-		return {
-			sourceBranch: worktree.branch,
-			targetBranch: branch,
-			worktreePath: worktree.worktreePath,
-		}
+			const branch = targetBranch ?? worktree.targetBranch
+			if (!branch) {
+				throw new Error("targetBranch is required when the session was created from a detached HEAD")
+			}
+
+			const targetGit = simpleGit(worktree.sourceCwd)
+			const checkedOutBranch = (await targetGit.revparse(["--abbrev-ref", "HEAD"])).trim()
+			if (checkedOutBranch !== branch) {
+				throw new Error(`Target branch ${branch} is not checked out at ${worktree.sourceCwd}`)
+			}
+			if (!(await targetGit.status()).isClean()) {
+				throw new Error(`Target branch ${branch} has uncommitted changes`)
+			}
+
+			const worktreeGit = simpleGit(worktree.worktreePath)
+			if (!(await worktreeGit.status()).isClean()) {
+				throw new Error("Session worktree has uncommitted changes; commit or stash them before integrating")
+			}
+
+			await targetGit.merge([worktree.branch, "--no-edit"])
+			if (deleteAfterMerge) {
+				if (!hasOtherSessionWorktreeOwners(sessionId, worktree.worktreePath)) {
+					await targetGit.raw(["worktree", "remove", "--force", worktree.worktreePath])
+					await targetGit.deleteLocalBranch(worktree.branch)
+				}
+				deleteSessionWorktree(sessionId)
+			}
+
+			return {
+				sourceBranch: worktree.branch,
+				targetBranch: branch,
+				worktreePath: worktree.worktreePath,
+			}
+		})
 	}
 	private readonly options: DiracAgentOptions
 	private readonly authentication: AcpAuthenticationManager
@@ -650,8 +652,8 @@ export class DiracAgent implements acp.Agent {
 	/** Session-owned mirror of the configuration currently committed to the active Task. */
 	private readonly activePromptOverrides: Map<string, Partial<Settings>> = new Map()
 
-	/** Config mutations are serialized independently from prompt lifecycle state. */
-	private readonly configuringSessions: Set<string> = new Set()
+	/** Pending and active runtime mutation counts; unmarked fork/delete operations do not own these guards. */
+	private readonly configuringSessions: Map<string, number> = new Map()
 
 	/** Per-session barriers ensure runtime snapshots are read and committed in order. */
 	private readonly sessionRuntimeMutationTails: Map<string, Promise<void>> = new Map()
@@ -886,7 +888,7 @@ export class DiracAgent implements acp.Agent {
 		const mutationTail = previousMutation.then(() => mutationBarrier)
 		this.sessionRuntimeMutationTails.set(sessionId, mutationTail)
 		if (options.markConfiguring) {
-			this.configuringSessions.add(sessionId)
+			this.configuringSessions.set(sessionId, (this.configuringSessions.get(sessionId) ?? 0) + 1)
 		}
 
 		await previousMutation
@@ -894,11 +896,13 @@ export class DiracAgent implements acp.Agent {
 			return await operation()
 		} finally {
 			releaseMutation()
+			if (options.markConfiguring) {
+				const remaining = (this.configuringSessions.get(sessionId) ?? 0) - 1
+				if (remaining > 0) this.configuringSessions.set(sessionId, remaining)
+				else this.configuringSessions.delete(sessionId)
+			}
 			if (this.sessionRuntimeMutationTails.get(sessionId) === mutationTail) {
 				this.sessionRuntimeMutationTails.delete(sessionId)
-				if (options.markConfiguring) {
-					this.configuringSessions.delete(sessionId)
-				}
 			}
 		}
 	}
@@ -1513,37 +1517,40 @@ export class DiracAgent implements acp.Agent {
 		})
 	}
 
-	/** Capture the source session's fork state; must run under the source session's synchronization. */
+	/** Capture source state and worktree ownership under the source session barrier and inventory lock. */
 	private async captureForkSnapshot(sourceSessionId: string, newSessionId: string, requestedCwd?: string): Promise<ForkSnapshot> {
-		if (this.sessionStates.get(sourceSessionId)?.status === AcpSessionStatus.Processing) {
-			throw new Error(`Cannot fork session ${sourceSessionId} while a prompt is in progress`)
-		}
-		const sourceState = resolveForkSourceState({
-			dataDir: this.ctx.DATA_DIR,
-			sourceSessionId,
-			requestedCwd,
-			defaultCwd: this.options.cwd,
-			activeSource: this.sessions.get(sourceSessionId),
-			activeOverrides: this.acpSessionOverrides.get(sourceSessionId),
-		})
-		const forkTitle = sourceState.sourceTitle ? `Fork of ${sourceState.sourceTitle}` : `Fork of ${sourceSessionId.slice(0, 8)}`
-		const sharedWorktree = resolveSharedSessionWorktree(sourceSessionId, sourceState.sourceCwd)
-		if (sharedWorktree) {
-			setSessionWorktree(newSessionId, sharedWorktree)
-		}
-		try {
-			const newTaskId = await cloneForkedSessionArtifacts({
+		return withTaskHistoryInventoryLock(async () => {
+			if (this.sessionStates.get(sourceSessionId)?.status === AcpSessionStatus.Processing) {
+				throw new Error(`Cannot fork session ${sourceSessionId} while a prompt is in progress`)
+			}
+			const sourceState = resolveForkSourceState({
 				dataDir: this.ctx.DATA_DIR,
 				sourceSessionId,
-				newSessionId,
-				sourceState,
-				forkTitle,
+				requestedCwd,
+				defaultCwd: this.options.cwd,
+				activeSource: this.sessions.get(sourceSessionId),
+				activeOverrides: this.acpSessionOverrides.get(sourceSessionId),
 			})
-			return { sourceState, forkTitle, newTaskId, sharedWorktree }
-		} catch (error) {
-			if (sharedWorktree) deleteSessionWorktree(newSessionId)
-			throw error
-		}
+			// Integration may have removed this workspace while the fork waited for the lock.
+			const workspace = await fs.stat(sourceState.sourceCwd)
+			if (!workspace.isDirectory()) throw new Error(`Fork workspace is not a directory: ${sourceState.sourceCwd}`)
+			const forkTitle = sourceState.sourceTitle ? `Fork of ${sourceState.sourceTitle}` : `Fork of ${sourceSessionId.slice(0, 8)}`
+			const sharedWorktree = resolveSharedSessionWorktree(sourceSessionId, sourceState.sourceCwd)
+			if (sharedWorktree) setSessionWorktree(newSessionId, sharedWorktree)
+			try {
+				const newTaskId = await cloneForkedSessionArtifacts({
+					dataDir: this.ctx.DATA_DIR,
+					sourceSessionId,
+					newSessionId,
+					sourceState,
+					forkTitle,
+				})
+				return { sourceState, forkTitle, newTaskId, sharedWorktree }
+			} catch (error) {
+				if (sharedWorktree) deleteSessionWorktree(newSessionId)
+				throw error
+			}
+		})
 	}
 
 	/**

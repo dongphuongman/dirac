@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process"
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import Mutex from "p-mutex"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { DiracAgent } from "./DiracAgent.js"
 
@@ -41,6 +42,7 @@ const mocks = vi.hoisted(() => {
 		MockController,
 		controllerOptions,
 		taskHistory,
+		beforeWorktreeRemoval: vi.fn(async () => { }),
 		initializeCliContext: vi.fn(() => ({
 			extensionContext: {},
 			storageContext: {},
@@ -57,9 +59,27 @@ vi.mock("@/core/controller", () => ({ Controller: mocks.MockController }))
 vi.mock("../vscode-context.js", () => ({ initializeCliContext: mocks.initializeCliContext }))
 vi.mock("../initCoreServices.js", () => ({ initCoreServices: mocks.initCoreServices }))
 vi.mock("@/core/storage/disk", () => ({ setRuntimeHooksDir: mocks.setRuntimeHooksDir }))
-vi.mock("@/core/storage/taskHistory", () => ({
-	withTaskHistoryInventoryLock: vi.fn(async (action: () => Promise<unknown>) => await action()),
-}))
+vi.mock("@/core/storage/taskHistory", () => {
+	const mutex = new Mutex()
+	return { withTaskHistoryInventoryLock: <T>(action: () => Promise<T>) => mutex.withLock(action) }
+})
+vi.mock("simple-git", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("simple-git")>()
+	return {
+		...actual,
+		default: (cwd: string) => {
+			const instance = actual.default(cwd)
+			const raw = instance.raw.bind(instance)
+			instance.raw = ((args: string[]) => {
+				if (args[0] === "worktree" && args[1] === "remove") {
+					return mocks.beforeWorktreeRemoval().then(() => raw(args))
+				}
+				return raw(args)
+			}) as typeof instance.raw
+			return instance
+		},
+	}
+})
 vi.mock("@/hosts/host-provider.js", () => ({ HostProvider: { initialize: mocks.hostProviderInitialize } }))
 vi.mock("@/core/storage/StateManager", () => ({
 	StateManager: {
@@ -285,6 +305,68 @@ describe("DiracAgent ACP worktrees", () => {
 		expect(mocks.controllerOptions.at(-1)).toEqual({ workspaceCwd: worktree.path })
 
 		await agent.deleteSession({ sessionId: forkedSession.sessionId })
+		expect(existsSync(worktree.path)).toBe(false)
+	})
+
+	it("rejects a fork queued while integration is removing its source worktree", async () => {
+		const repository = createRepository()
+		directories.push(repository)
+		const agent = await createAgent(repository)
+		const source = await agent.newSession({
+			cwd: repository,
+			mcpServers: [],
+			_meta: { "dev.dirac/worktree": true },
+		} as any)
+		const worktree = (source as any)._meta["dev.dirac/worktree"]
+		directories.push(path.dirname(worktree.path))
+
+		let removalEntered!: () => void
+		const removing = new Promise<void>((resolve) => { removalEntered = resolve })
+		let releaseRemoval!: () => void
+		const removalGate = new Promise<void>((resolve) => { releaseRemoval = resolve })
+		mocks.beforeWorktreeRemoval.mockImplementationOnce(async () => {
+			removalEntered()
+			await removalGate
+		})
+
+		const integration = agent.integrateSessionWorktree(source.sessionId)
+		await removing
+		const fork = agent.unstable_forkSession({ sessionId: source.sessionId, cwd: worktree.path, mcpServers: [] })
+		const forkResult = Promise.allSettled([fork])
+		// Let the fork reach snapshot capture while the physical removal is paused.
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		releaseRemoval()
+		await integration
+		const [result] = await forkResult
+		expect(result.status).toBe("rejected")
+		if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "ENOENT" })
+		expect(agent.sessions.size).toBe(1)
+		expect(existsSync(worktree.path)).toBe(false)
+	})
+
+	it("retains shared ownership when forking a source that already integrated its worktree", async () => {
+		const repository = createRepository()
+		directories.push(repository)
+		const agent = await createAgent(repository)
+		const source = await agent.newSession({
+			cwd: repository,
+			mcpServers: [],
+			_meta: { "dev.dirac/worktree": true },
+		} as any)
+		const worktree = (source as any)._meta["dev.dirac/worktree"]
+		directories.push(path.dirname(worktree.path))
+		const forkRequest = { sessionId: source.sessionId, cwd: worktree.path, mcpServers: [] }
+		const firstFork = await agent.unstable_forkSession(forkRequest)
+
+		// Integration releases only the source's ownership; the first fork still needs W.
+		await agent.integrateSessionWorktree(source.sessionId)
+		expect(existsSync(worktree.path)).toBe(true)
+		const secondFork = await agent.unstable_forkSession(forkRequest)
+		const uncommittedFile = path.join(worktree.path, "uncommitted.txt")
+		writeFileSync(uncommittedFile, "second fork edits\n")
+		await agent.deleteSession({ sessionId: firstFork.sessionId })
+		expect(readFileSync(uncommittedFile, "utf8")).toBe("second fork edits\n")
+		await agent.deleteSession({ sessionId: secondFork.sessionId })
 		expect(existsSync(worktree.path)).toBe(false)
 	})
 })

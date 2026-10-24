@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises"
 import path from "node:path"
 import type * as acp from "@agentclientprotocol/sdk"
-import { withTaskHistoryInventoryLock } from "@/core/storage/taskHistory"
 import type { HistoryItem, TaskHistoryItem } from "@shared/HistoryItem"
 import type { Settings } from "@shared/storage/state-keys"
 import { StateManager } from "@/core/storage/StateManager"
@@ -170,7 +169,7 @@ export function resolveForkSourceState(options: {
 	}
 }
 
-/** Clone a source session's backing task directory, taskHistory entry, and ACP update journal onto a new session ID. */
+/** Clone task files, history, and journal. Caller must hold the task-history inventory lock through ownership registration. */
 export async function cloneForkedSessionArtifacts(options: {
 	dataDir: string
 	sourceSessionId: string
@@ -182,31 +181,28 @@ export async function cloneForkedSessionArtifacts(options: {
 	const { sourceTaskId } = sourceState
 	if (!sourceTaskId) return undefined
 
-	// Hold the task-history inventory lock across filesystem copy, history upsert, and journal copy to prevent concurrent deletion.
-	return await withTaskHistoryInventoryLock(async () => {
-		const newTaskId = crypto.randomUUID()
-		const sourceTaskDir = path.join(dataDir, "tasks", sourceTaskId)
-		const newTaskDir = path.join(dataDir, "tasks", newTaskId)
-		await fs.mkdir(path.dirname(newTaskDir), { recursive: true })
-		await fs.cp(sourceTaskDir, newTaskDir, { recursive: true })
+	const newTaskId = crypto.randomUUID()
+	const sourceTaskDir = path.join(dataDir, "tasks", sourceTaskId)
+	const newTaskDir = path.join(dataDir, "tasks", newTaskId)
+	await fs.mkdir(path.dirname(newTaskDir), { recursive: true })
+	await fs.cp(sourceTaskDir, newTaskDir, { recursive: true })
 
-		const sourceTaskHistory = sourceState.sourceHistoryItem as TaskHistoryItem | undefined
-		const historyItem: TaskHistoryItem = {
-			id: newTaskId,
-			ulid: newSessionId,
-			ts: Date.now(),
-			task: forkTitle,
-			tokensIn: sourceTaskHistory?.tokensIn ?? 0,
-			tokensOut: sourceTaskHistory?.tokensOut ?? 0,
-			totalCost: sourceTaskHistory?.totalCost ?? 0,
-			cwdOnTaskInitialization: sourceState.sourceCwd,
-			workspaceRootPath: sourceState.sourceCwd,
-			runKind: "task",
-		}
-		const stateManager = StateManager.get()
-		stateManager.upsertTaskHistoryItem(historyItem)
-		await stateManager.flushPendingState()
-		copySessionUpdates(sourceSessionId, newSessionId)
-		return newTaskId
-	})
+	const sourceTaskHistory = sourceState.sourceHistoryItem as TaskHistoryItem | undefined
+	const historyItem: TaskHistoryItem = {
+		id: newTaskId,
+		ulid: newSessionId,
+		ts: Date.now(),
+		task: forkTitle,
+		tokensIn: sourceTaskHistory?.tokensIn ?? 0,
+		tokensOut: sourceTaskHistory?.tokensOut ?? 0,
+		totalCost: sourceTaskHistory?.totalCost ?? 0,
+		cwdOnTaskInitialization: sourceState.sourceCwd,
+		workspaceRootPath: sourceState.sourceCwd,
+		runKind: "task",
+	}
+	const stateManager = StateManager.get()
+	stateManager.upsertTaskHistoryItem(historyItem)
+	await stateManager.flushPendingState()
+	copySessionUpdates(sourceSessionId, newSessionId)
+	return newTaskId
 }

@@ -161,6 +161,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 })
 vi.mock("@/core/controller", () => ({ Controller: mocks.MockController }))
 vi.mock("@/core/storage/disk", () => ({ setRuntimeHooksDir: vi.fn() }))
+vi.mock("@/hosts/host-provider", () => ({
+	HostProvider: { get: () => ({ globalStorageFsPath: taskStorageDirectory }) },
+}))
+let taskStorageDirectory: string
 vi.mock("@/core/storage/taskHistory", () => ({
 	withTaskHistoryInventoryLock: vi.fn(async (action: () => Promise<unknown>) => {
 		const previous = inventoryLockTail
@@ -861,7 +865,7 @@ describe("DiracAgent ACP conversation continuity", () => {
 			; (agent as any).ctx = { extensionContext: {}, DATA_DIR: "/tmp/dirac-test-data" }
 		const { sessionId } = await agent.newSession({ cwd: "/tmp/workspace", mcpServers: [] } as any)
 		const controller = mocks.controllers[0]
-			; (agent as any).configuringSessions.add(sessionId)
+			; (agent as any).configuringSessions.set(sessionId, 1)
 
 		await expect(agent.closeSession({ sessionId } as any)).rejects.toThrow("applying a runtime configuration change")
 		await expect(agent.shutdown()).resolves.toBeUndefined()
@@ -891,7 +895,7 @@ describe("DiracAgent ACP conversation continuity", () => {
 
 			const forkResponse = await agent.unstable_forkSession({
 				sessionId: sourceSessionId,
-				cwd: "/tmp/workspace",
+				cwd: tempDataDir,
 				mcpServers: [],
 			})
 
@@ -974,6 +978,8 @@ describe("DiracAgent ACP conversation continuity", () => {
 			releaseAssertion()
 			await expect(forkPromise).rejects.toThrow(`Cannot fork session ${sourceSessionId} while a prompt is in progress`)
 			await expect(promptPromise).resolves.toEqual({ stopReason: "end_turn" })
+			await expect(agent.closeSession({ sessionId: sourceSessionId })).resolves.toEqual({})
+			await expect(agent.deleteSession({ sessionId: sourceSessionId })).resolves.toEqual({})
 		} finally {
 			if (sourceSessionId) deleteSessionUpdates(sourceSessionId)
 			fs.rmSync(tempDataDir, { recursive: true, force: true })
@@ -1041,7 +1047,7 @@ describe("DiracAgent ACP conversation continuity", () => {
 
 			const forkPromise = agent.unstable_forkSession({
 				sessionId: sourceSessionId,
-				cwd: "/tmp/workspace",
+				cwd: tempDataDir,
 				mcpServers: [],
 			})
 			await copyStarted
@@ -1079,6 +1085,7 @@ describe("DiracAgent ACP conversation continuity", () => {
 
 	it("protects an in-flight fork snapshot when the source session is deleted during the copy", async () => {
 		const tempDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "dirac-fork-copy-delete-race-"))
+		taskStorageDirectory = tempDataDir
 		const historyRecords: any[] = []
 		let sourceSessionId: string | undefined
 		let forkedSessionId: string | undefined
@@ -1144,7 +1151,7 @@ describe("DiracAgent ACP conversation continuity", () => {
 
 			const forkPromise = agent.unstable_forkSession({
 				sessionId: sourceSessionId,
-				cwd: "/tmp/workspace",
+				cwd: tempDataDir,
 				mcpServers: [],
 			})
 			await copyStarted
