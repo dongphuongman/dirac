@@ -902,7 +902,7 @@ function createMockConfig(): any {
 				format: sinon.stub(),
 			},
 			fileContextTracker: {},
-			diracIgnoreController: {},
+			diracIgnoreController: { validateAccess: sinon.stub().returns(true) },
 			commandPermissionController: {},
 			contextManager: { getNextTruncationRange: sinon.stub() },
 		},

@@ -2,6 +2,8 @@ import { strict as assert } from "node:assert"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { DiracIgnoreController } from "@core/ignore/DiracIgnoreController"
+import { CardStatus } from "@shared/ExtensionMessage"
 import * as iconv from "iconv-lite"
 import { readTextFileWindow } from "@integrations/misc/read-text-file-window"
 import { DiracDefaultTool } from "@shared/tools"
@@ -14,7 +16,6 @@ import sinon from "sinon"
 import { TaskState } from "../../../../TaskState"
 import { createMockContext, createMockTaskMessenger } from "../../../__tests__/helpers/mockTaskConfig"
 import { SurfaceAdapter } from "../../../adapters/SurfaceAdapter"
-import { ToolValidator } from "../../../ToolValidator"
 import type { TaskConfig } from "../../../types/TaskConfig"
 import { ReadFileTool } from "../ReadFileTool"
 
@@ -35,7 +36,6 @@ let tmpDir: string
 
 class ReadFileToolHandler {
 	private tool = new ReadFileTool()
-	constructor(_validator: any) { }
 	async execute(config: TaskConfig, block: any) {
 		const env = new SurfaceAdapter(config)
 		return this.tool.processCall(block.params, env)
@@ -113,9 +113,7 @@ function createConfig(supportsImages = false) {
 		taskMessenger: createMockTaskMessenger(),
 	} as unknown as TaskConfig
 
-	const validator = new ToolValidator({ validateAccess: () => true } as any)
-
-	return { config, callbacks, taskState, validator }
+	return { config, callbacks, taskState }
 }
 
 function makeBlock(relPath?: string, params: Record<string, unknown> = {}) {
@@ -141,8 +139,8 @@ describe("ReadFileToolHandler.execute – file not found", () => {
 	})
 
 	it("returns a tool error (not a thrown exception) for a non-existent file", async () => {
-		const { config, taskState, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config, taskState } = createConfig()
+		const handler = new ReadFileToolHandler()
 
 		const result = await handler.execute(config, makeBlock("no-such-file.py"))
 
@@ -152,8 +150,8 @@ describe("ReadFileToolHandler.execute – file not found", () => {
 	})
 
 	it("does not increment consecutiveMistakeCount for non-existent files", async () => {
-		const { config, taskState, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config, taskState } = createConfig()
+		const handler = new ReadFileToolHandler()
 
 		await handler.execute(config, makeBlock("ghost-1.py"))
 		assert.equal(taskState.consecutiveMistakeCount, 0)
@@ -166,8 +164,8 @@ describe("ReadFileToolHandler.execute – file not found", () => {
 	})
 
 	it("resets consecutiveMistakeCount to 0 after a successful read", async () => {
-		const { config, taskState, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config, taskState } = createConfig()
+		const handler = new ReadFileToolHandler()
 
 		// Non-existent files do not accumulate mistakes
 		await handler.execute(config, makeBlock("ghost-1.py"))
@@ -183,13 +181,142 @@ describe("ReadFileToolHandler.execute – file not found", () => {
 	})
 
 	it("increments consecutiveMistakeCount when path parameter is missing", async () => {
-		const { config, taskState, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config, taskState } = createConfig()
+		const handler = new ReadFileToolHandler()
 
 		const result = await handler.execute(config, makeBlock())
 
 		assert.ok((result as string).includes("Missing required parameter"))
 		assert.equal(taskState.consecutiveMistakeCount, 1)
+	})
+})
+
+describe("ReadFileToolHandler.execute – .diracignore (issue 277)", () => {
+	let sandbox: sinon.SinonSandbox
+	let ignoreController: DiracIgnoreController
+	const canary = "SYNTHETIC_ISSUE_277_SECRET_CANARY"
+	const ignoredText = "credentials/secret.txt"
+	const ignoredNotebook = "credentials/secret.ipynb"
+
+	beforeEach(async () => {
+		sandbox = sinon.createSandbox()
+		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "dirac-read-ignore-test-"))
+		sandbox.stub(pathUtils, "isLocatedInWorkspace").resolves(true)
+		AnchorStateManager.reset("ulid-1")
+		await fs.mkdir(path.join(tmpDir, "credentials"))
+		await fs.writeFile(path.join(tmpDir, ".diracignore"), "credentials/\n")
+		await fs.writeFile(path.join(tmpDir, ignoredText), `first line\n${canary}\nlast line`)
+		await fs.writeFile(path.join(tmpDir, ignoredNotebook), JSON.stringify({
+			nbformat: 4,
+			nbformat_minor: 5,
+			metadata: {},
+			cells: [{ cell_type: "markdown", metadata: {}, source: [canary] }],
+		}))
+		ignoreController = new DiracIgnoreController(tmpDir)
+		ignoreController.yoloMode = false
+		await ignoreController.initialize()
+		assert.equal(ignoreController.validateAccess(path.join(tmpDir, ignoredText)), false)
+		assert.equal(ignoreController.validateAccess(path.join(tmpDir, ignoredNotebook)), false)
+	})
+
+	afterEach(async () => {
+		await ignoreController?.dispose()
+		AnchorStateManager.reset("ulid-1")
+		sandbox.restore()
+		await fs.rm(tmpDir, { recursive: true, force: true })
+	})
+
+	function createIgnoredConfig() {
+		const { config } = createConfig()
+		config.yoloModeToggled = false
+		config.services.diracIgnoreController = ignoreController
+		return config
+	}
+
+	function assertDenied(result: unknown) {
+		assert.equal(typeof result, "string")
+		assert.ok(!(result as string).includes(canary), "ignored canary must not reach the model")
+		assert.match(result as string, /Error reading file:/)
+		assert.match(result as string, /blocked.*\.diracignore/)
+	}
+
+	for (const { name, file, params } of [
+		{ name: "plain", file: ignoredText, params: {} },
+		{ name: "ranged", file: ignoredText, params: { start_line: 2, end_line: 2 } },
+		{ name: "anchored", file: ignoredText, params: { include_anchors: true } },
+		{ name: "anchored ranged", file: ignoredText, params: { start_line: 2, end_line: 2, include_anchors: true } },
+		{ name: "rich notebook", file: ignoredNotebook, params: {} },
+	]) {
+		it(`denies ${name} reads without caching content or preparing anchors`, async () => {
+			const config = createIgnoredConfig()
+			const updateEntries = sandbox.spy(config.context.task, "updateEntries")
+			const ensureAnchorState = sandbox.spy(config.context, "ensureAnchorState")
+
+			const result = await new ReadFileToolHandler().execute(config, makeBlock(file, params))
+
+			assertDenied(result)
+			assert.deepEqual((await config.context.task.get("fileHashes")) ?? {}, {})
+			assert.equal(AnchorStateManager.isTracking(path.join(tmpDir, file), config.ulid), false)
+			sinon.assert.notCalled(updateEntries)
+			sinon.assert.notCalled(ensureAnchorState)
+		})
+	}
+
+	it("denies absolute and normalized relative aliases", async () => {
+		const config = createIgnoredConfig()
+		for (const file of [path.join(tmpDir, ignoredText), "./credentials/../credentials/secret.txt"]) {
+			assertDenied(await new ReadFileToolHandler().execute(config, makeBlock(file)))
+		}
+	})
+
+	it("preserves the ignore controller's explicit YOLO bypass", async () => {
+		const config = createIgnoredConfig()
+		config.yoloModeToggled = true
+		ignoreController.yoloMode = true
+		const result = await new ReadFileToolHandler().execute(config, makeBlock(ignoredText))
+		assert.ok((result as string).includes(canary))
+	})
+
+	it("continues a mixed batch and caches and anchors only the allowed content", async () => {
+		const config = createIgnoredConfig()
+		const allowedFile = "public.txt"
+		await fs.writeFile(path.join(tmpDir, allowedFile), "public content")
+		assert.equal(ignoreController.validateAccess(path.join(tmpDir, allowedFile)), true)
+
+		const result = await new ReadFileToolHandler().execute(config, makeBlock(undefined, {
+			paths: [ignoredText, allowedFile],
+			include_anchors: true,
+		}))
+
+		assertDenied(result)
+		assert.ok((result as string).includes(`--- ${ignoredText} ---`))
+		assert.ok((result as string).includes(`--- ${allowedFile} ---`))
+		assert.match(result as string, /^[A-Z][a-zA-Z]*§public content$/m)
+		assert.equal(AnchorStateManager.isTracking(path.join(tmpDir, ignoredText), config.ulid), false)
+		assert.equal(AnchorStateManager.isTracking(path.join(tmpDir, allowedFile), config.ulid), true)
+		assert.deepEqual(Object.keys((await config.context.task.get("fileHashes")) ?? {}), [
+			`${path.join(tmpDir, allowedFile)}#anchored`,
+		])
+	})
+
+	it("finalizes a denied read card as an error without exposing the canary", async () => {
+		const config = createIgnoredConfig()
+		config.isSubagentExecution = false
+		const card = {
+			finalize: sandbox.stub().resolves(),
+			setBody: sandbox.stub().resolves(),
+			update: sandbox.stub().resolves(),
+		}
+		sandbox.stub(SurfaceAdapter.prototype, "createCard").resolves(card as any)
+
+		const result = await new ReadFileToolHandler().execute(config, makeBlock(ignoredText))
+
+		assertDenied(result)
+		sinon.assert.calledOnceWithExactly(card.finalize, CardStatus.ERROR)
+		sinon.assert.calledOnce(card.update)
+		assert.equal(card.update.firstCall.args[0].status, CardStatus.ERROR)
+		assert.match(card.update.firstCall.args[0].body, /blocked.*\.diracignore/)
+		assert.ok(!JSON.stringify(card.update.args).includes(canary))
 	})
 })
 
@@ -218,8 +345,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	}
 
 	it("defaults to plain output while allowing a later anchored read of unchanged content", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "cache-mode.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "first line\nsecond line")
 
@@ -238,8 +365,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("re-emits anchored content when the persisted file hash outlives anchor state", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "lost-anchor-state.txt"
 		const absolutePath = path.join(tmpDir, realFile)
 		await fs.writeFile(absolutePath, "first line\nsecond line")
@@ -256,8 +383,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("re-emits a restored anchored mapping so its coordinates remain available", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "restored-anchor-state.txt"
 		const absolutePath = path.join(tmpDir, realFile)
 		await fs.writeFile(absolutePath, "first line\nsecond line")
@@ -277,8 +404,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("never suppresses a fresh mapping seeded after the emitted mapping was lost", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "failed-edit-seeded-state.txt"
 		const absolutePath = path.join(tmpDir, realFile)
 		const lines = ["first line", "second line"]
@@ -300,8 +427,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("does not let a partial read suppress a later full read", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "partial-then-full.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "first line\nsecond line\nthird line")
 
@@ -319,8 +446,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("enforces the text byte limit after selecting lines", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "large-lines.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), `${"x".repeat(51 * 1024)}\nsmall`)
 
@@ -340,8 +467,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("rejects zero and fractional line numbers", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "invalid-range.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "content")
 
@@ -364,8 +491,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("supports start-only, end-only, and end-past-EOF ranges", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "range-shapes.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "one\ntwo\nthree\nfour")
 
@@ -385,8 +512,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("rejects negative, nonnumeric, reversed, and past-EOF ranges", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "more-invalid-ranges.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "one\ntwo")
 
@@ -402,8 +529,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("enforces the limit for full and unbounded reads", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "large-full-read.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "x".repeat(50 * 1024 + 1))
 
@@ -415,8 +542,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("enforces the limit across multiple selected lines", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "combined-large-range.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), `${"a".repeat(30 * 1024)}\n${"b".repeat(21 * 1024)}`)
 
@@ -425,8 +552,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("accepts exactly 50 KiB and counts UTF-8 bytes", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const exactFile = "exact-limit.txt"
 		const multibyteFile = "multibyte-limit.txt"
 		await fs.writeFile(path.join(tmpDir, exactFile), "x".repeat(50 * 1024))
@@ -441,8 +568,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("does not cache a read that failed the text-size guard", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "failed-size-cache.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "x".repeat(50 * 1024 + 1))
 
@@ -456,8 +583,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("never suppresses partial reads even when a full read is cached", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "full-then-partial.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "one\ntwo\nthree")
 
@@ -472,8 +599,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("does not cache an explicit range even when it covers the whole file", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "explicit-complete-range.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "one\ntwo")
 
@@ -489,8 +616,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("returns changed full-file content instead of the cached response", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "changed-file.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "before")
 		await handler.execute(config, makeBlock(realFile))
@@ -502,8 +629,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("shares cache identity across relative aliases of the same file", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "aliased-file.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "same file")
 
@@ -513,8 +640,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("anchors only the selected lines in a ranged read", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "anchored-range.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), "first\nsecond\nthird")
 
@@ -529,8 +656,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("decodes streamed non-UTF-8 text", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const cases = [
 			{ file: "windows-1252.txt", encoding: "windows-1252", text: "Price €100 — “yes” ".repeat(50) },
 			{ file: "utf-16.txt", encoding: "utf16", text: "first UTF-16 line\nsecond UTF-16 line" },
@@ -544,8 +671,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("keeps decoding when non-ASCII UTF-8 appears after an ASCII-only stream chunk", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "late-utf8.txt"
 		await fs.writeFile(path.join(tmpDir, realFile), `${"a".repeat(70 * 1024)}\nlate café`)
 
@@ -573,8 +700,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("rejects binary data routed through the raw text reader", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "binary-data.bin"
 		await fs.writeFile(
 			path.join(tmpDir, realFile),
@@ -622,8 +749,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("streams late ranges from oversized files without anchors or read caching", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const realFile = "oversized.log"
 		const lines = Array.from(
 			{ length: MAX_ANCHORED_FILE_LINES + 1 },
@@ -669,8 +796,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 
 
 	it("returns images without applying ranges, text limits, or text hashing", async () => {
-		const { config, validator } = createConfig(true)
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig(true)
+		const handler = new ReadFileToolHandler()
 		const realFile = "pixel.png"
 		const png = Buffer.from(
 			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -692,8 +819,8 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("continues processing other files when one selected text is too large", async () => {
-		const { config, validator } = createConfig()
-		const handler = new ReadFileToolHandler(validator)
+		const { config } = createConfig()
+		const handler = new ReadFileToolHandler()
 		const largeFile = "multi-large.txt"
 		const smallFile = "multi-small.txt"
 		await fs.writeFile(path.join(tmpDir, largeFile), "x".repeat(50 * 1024 + 1))
@@ -711,9 +838,9 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("gives each card its own location when reading several files", async () => {
-		const { config, validator } = createConfig()
+		const { config } = createConfig()
 		const uiConfig = { ...config, isSubagentExecution: false } as TaskConfig
-		const handler = new ReadFileToolHandler(validator)
+		const handler = new ReadFileToolHandler()
 		const a = "multi-loc-a.md"
 		const b = "multi-loc-b.md"
 		await fs.writeFile(path.join(tmpDir, a), "alpha\n")
@@ -737,9 +864,9 @@ describe("ReadFileToolHandler.execute – include_anchors visibility and cache",
 	})
 
 	it("includes the requested start line in the card location", async () => {
-		const { config, validator } = createConfig()
+		const { config } = createConfig()
 		const uiConfig = { ...config, isSubagentExecution: false } as TaskConfig
-		const handler = new ReadFileToolHandler(validator)
+		const handler = new ReadFileToolHandler()
 		const realFile = "multi-loc-range.md"
 		await fs.writeFile(path.join(tmpDir, realFile), "one\ntwo\nthree\n")
 

@@ -225,10 +225,11 @@ async function extractTextFromExcel(filePath: string): Promise<string> {
 /**
  * Helper function used to load file(s) and format them into a string
  */
-export async function processFilesIntoText(files: string[]): Promise<string> {
+export async function processFilesIntoText(files: string[], assertReadAccess?: (resolvedPath: string) => void): Promise<string> {
 	const fileContentsPromises = files.map(async (filePath) => {
 		try {
 			const resolvedPath = resolveFileUri(filePath)
+			assertReadAccess?.(resolvedPath)
 			const content = await extractTextFromFile(resolvedPath)
 			return `<file_content path="${resolvedPath.toPosix()}">\n${content}\n</file_content>`
 		} catch (error) {

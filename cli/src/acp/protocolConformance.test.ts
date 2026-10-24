@@ -443,6 +443,101 @@ describe("ACP protocol conformance over raw stdio", () => {
 		45_000,
 	)
 
+	it("blocks diracignored read_file content before sending the next model request (#277)", async () => {
+		const canary = "canary-Zq7x4417"
+		const requests: Array<{ messages: unknown[] }> = []
+		const server = createServer(async (request, response) => {
+			if (request.method === "GET") {
+				response.setHeader("Content-Type", "application/json")
+				response.end(JSON.stringify({ data: [{ id: "ignore-fixture", object: "model" }] }))
+				return
+			}
+			let body = ""
+			for await (const chunk of request) body += chunk
+			requests.push(JSON.parse(body))
+			const firstRequest = requests.length === 1
+			response.setHeader("Content-Type", "text/event-stream")
+			response.end(`data: ${JSON.stringify({
+				id: `ignore-completion-${requests.length}`,
+				object: "chat.completion.chunk",
+				choices: [{
+					index: 0,
+					delta: {
+						tool_calls: [{
+							index: 0,
+							id: `ignore-tool-${requests.length}`,
+							type: "function",
+							function: {
+								name: firstRequest ? "read_file" : "respond",
+								arguments: JSON.stringify(firstRequest
+									? { paths: ["credentials/prod.txt"] }
+									: { operation: "complete", text: "Ignore verification finished." }),
+							},
+						}]
+					},
+					finish_reason: "tool_calls",
+				}],
+			})}\n\ndata: [DONE]\n\n`)
+		})
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+		const address = server.address() as { port: number }
+		try {
+			const configDir = await temporaryDirectory("dirac-acp-config-")
+			const cwd = await temporaryDirectory("dirac-acp-workspace-")
+			await mkdir(path.join(cwd, "credentials"))
+			await writeFile(path.join(cwd, ".diracignore"), "credentials/\n")
+			await writeFile(path.join(cwd, "credentials/prod.txt"), `Production vault notes\nThis is synthetic test data, not a real credential.\nmarker phrase: ${canary}\n`)
+			await mkdir(path.join(configDir, "data"))
+			await writeFile(path.join(configDir, "data/globalState.json"), JSON.stringify({
+				welcomeViewCompleted: true,
+				isNewUser: false,
+				mode: "act",
+				yoloModeToggled: false,
+				actModeApiProvider: "openai",
+				planModeApiProvider: "openai",
+				actModeOpenAiModelId: "ignore-fixture",
+				planModeOpenAiModelId: "ignore-fixture",
+				openAiBaseUrl: `http://127.0.0.1:${address.port}/v1`,
+				telemetrySetting: "disabled",
+				openTelemetryEnabled: false,
+				doubleCheckCompletionEnabled: false,
+				utilityModelUseCases: { condense: false, approval: false, earlyExit: false },
+			}))
+			await writeFile(path.join(configDir, "data/secrets.json"), JSON.stringify({ openAiApiKey: "local-ignore-fixture" }))
+			const client = createRawClient(configDir, cwd)
+			await client.initialize()
+			const session = await client.request("session/new", { cwd, mcpServers: [] })
+			const sessionId = session.result?.sessionId as string
+			expect(session.result?.configOptions).toEqual(expect.arrayContaining([
+				expect.objectContaining({ id: "mode", currentValue: "act" }),
+				expect.objectContaining({ id: "yolo", currentValue: false }),
+			]))
+			const result = await client.request("session/prompt", {
+				sessionId,
+				prompt: [{ type: "text", text: "I added a .diracignore to this project so that the credentials/ folder is off-limits to you. Before I rely on it, please verify it works: use your read_file tool on credentials/prod.txt and tell me exactly what the tool returned (an error, or the file's content)." }],
+			})
+			expect(result).toMatchObject({ result: { stopReason: "end_turn" } })
+			expect(requests).toHaveLength(2)
+			// Inspect the actual follow-up provider payload, not only the rendered card.
+			const modelContext = JSON.stringify(requests[1].messages)
+			expect(modelContext).not.toContain(canary)
+			expect(modelContext).toContain("blocked by the .diracignore")
+			expect(JSON.stringify(client.updates)).not.toContain(canary)
+			expect(client.updates).toEqual(expect.arrayContaining([
+				expect.objectContaining({
+					params: expect.objectContaining({
+						update: expect.objectContaining({ sessionUpdate: "tool_call_update", status: "failed" }),
+					})
+				}),
+			]))
+			await client.request("session/close", { sessionId })
+			await client.close()
+		} finally {
+			server.closeAllConnections()
+			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
+		}
+	}, 30_000)
+
 	it("sends saved model context on the first follow-up after a process restart", async () => {
 		const requests: Array<{ messages: unknown[] }> = []
 		const server = createServer(async (request, response) => {
