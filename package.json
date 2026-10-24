@@ -2,7 +2,7 @@
     "name": "dirac",
     "displayName": "Dirac",
     "description": "Reduces API costs by more than 50%, produces better and faster work. Uses line-anchored parallel edits, AST manipulation and a whole lot of neat optimizations. Fully Open Source.",
-    "version": "0.5.23",
+    "version": "0.5.24",
     "icon": "assets/icons/icon.png",
     "workspaces": [
         ".",
@@ -440,7 +440,7 @@
         "download-ripgrep": "node scripts/download-ripgrep.mjs",
         "prepare-extension-ripgrep-binaries": "node scripts/prepare-extension-ripgrep-binaries.mjs",
         "generate:tools": "npx tsx scripts/generate-tool-barrel.ts",
-        "postprotos": "biome format src/shared/proto src/core/controller src/hosts/ src/generated --write --no-errors-on-unmatched",
+        "postprotos": "biome format src/shared/proto src/generated --write --no-errors-on-unmatched",
         "clean:build": "rimraf dist dist-standalone webview-ui/build src/generated out/",
         "clean:deps": "rimraf node_modules webview-ui/node_modules",
         "clean:all": "npm run clean:build && npm run clean:deps",

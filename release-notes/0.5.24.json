@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "version": "0.5.24",
+  "kind": "patch",
+  "announce": true,
+  "sourceTag": "v0.5.23",
+  "analyzedCommit": "a3012df897bb04b3fbf7a3a6607830988cc0b00a",
+  "headline": "Updates and improvements",
+  "highlights": [
+    {
+      "id": "feat-5857f84e",
+      "title": "advertise session list/fork and recategorize inference_speed",
+      "category": "feat",
+      "evidence": [
+        "5857f84e1477945ef36cbb6cb109a3d5b0a105ab"
+      ]
+    },
+    {
+      "id": "feat-217e635e",
+      "title": "add dynamic /v1/models discovery for OpenAI-compatible provider across CLI and webview",
+      "category": "feat",
+      "evidence": [
+        "217e635ef7b2b7693ad93940975e51d6cacc526b"
+      ]
+    },
+    {
+      "id": "fix-a3012df8",
+      "title": "synchronize fork worktree ownership and release configuration guards",
+      "category": "fix",
+      "evidence": [
+        "a3012df897bb04b3fbf7a3a6607830988cc0b00a"
+      ]
+    },
+    {
+      "id": "fix-7f9ca7fe",
+      "title": "read_file bypasses .diracignore and sends ignored file contents to the model",
+      "category": "fix",
+      "evidence": [
+        "7f9ca7fe7d5b406da083692133a6dcd33da21179"
+      ]
+    },
+    {
+      "id": "fix-e0be9b81",
+      "title": "share worktree and sync fork snapshot",
+      "category": "fix",
+      "evidence": [
+        "e0be9b81f4ee6c4e1f4a563974488b498e9f4613"
+      ]
+    }
+  ]
+}
