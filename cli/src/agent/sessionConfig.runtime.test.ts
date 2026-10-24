@@ -29,6 +29,12 @@ vi.mock("@/core/controller/models/refreshOpenRouterModels", () => ({
 	refreshOpenRouterModels: refreshOpenRouterModelsMock,
 }))
 
+const getOpenAiModelsMock = vi.hoisted(() => vi.fn(async () => ({} as Record<string, ModelInfo>)))
+
+vi.mock("@/core/controller/models/refreshOpenAiModels", () => ({
+	getOpenAiModels: getOpenAiModelsMock,
+}))
+
 const dynamicOpenRouterModelId = "xiaomi/mimo-v2.5-pro"
 const dynamicOpenRouterModelInfo: ModelInfo = {
 	name: "MiMo V2.5 Pro",
@@ -82,6 +88,8 @@ describe("SessionConfigManager task runtime behavior", () => {
 		refreshGithubCopilotModelsMock.mockResolvedValue({})
 		refreshOpenRouterModelsMock.mockReset()
 		refreshOpenRouterModelsMock.mockResolvedValue({ [dynamicOpenRouterModelId]: dynamicOpenRouterModelInfo })
+		getOpenAiModelsMock.mockClear()
+		getOpenAiModelsMock.mockResolvedValue({})
 	})
 
 	it("updates both modes only when the task snapshot links their models", async () => {
@@ -300,6 +308,29 @@ describe("SessionConfigManager task runtime behavior", () => {
 		expect(refreshGithubCopilotModelsMock).toHaveBeenCalledTimes(1)
 	})
 
+	it("discovers models for the OpenAI-compatible provider while building config options", async () => {
+		getOpenAiModelsMock.mockResolvedValue({
+			"qwen2.5-coder:32b": openAiModelInfoSaneDefaults,
+			"llama3.3:70b": openAiModelInfoSaneDefaults,
+		})
+		const manager = new SessionConfigManager()
+		const runtime: Partial<Settings> = {
+			mode: "act",
+			planActSeparateModelsSetting: false,
+			planModeApiProvider: "openai",
+			actModeApiProvider: "openai",
+			planModeOpenAiModelId: "qwen2.5-coder:32b",
+			actModeOpenAiModelId: "qwen2.5-coder:32b",
+		}
+
+		const options = await manager.getSessionConfigOptions(session(), runtime)
+		const model = selectOption(options, "model")
+
+		expect(getOpenAiModelsMock).toHaveBeenCalledTimes(1)
+		expect(optionValues(model)).toContain("qwen2.5-coder:32b")
+		expect(optionValues(model)).toContain("llama3.3:70b")
+	})
+
 	it("removes a disabled provider and normalizes its active session", async () => {
 		const providerConfiguration = {
 			isProviderEnabled: vi.fn((provider: string) => provider !== "deepseek"),
@@ -344,15 +375,29 @@ describe("SessionConfigManager task runtime behavior", () => {
 	})
 
 	it("uses standard ACP categories with provider before model", async () => {
-		const options = await new SessionConfigManager().getSessionConfigOptions(session(), linkedDeepSeekRuntime())
+		const runtime: Partial<Settings> = {
+			mode: "act",
+			planActSeparateModelsSetting: false,
+			planModeApiProvider: "openai-native",
+			actModeApiProvider: "openai-native",
+			planModeApiModelId: "gpt-5.4",
+			actModeApiModelId: "gpt-5.4",
+		}
+		const options = await new SessionConfigManager().getSessionConfigOptions(session(), runtime)
 		expect(options.map(({ id, category }) => [id, category])).toEqual([
 			["mode", "mode"],
 			["auto_approve", "mode"],
 			["yolo", "mode"],
 			["provider", "_provider"],
 			["model", "model"],
+			["inference_speed", "model_config"],
 			["reasoning_effort", "thought_level"],
+			["thinking_budget", "thought_level"],
 		])
+		const speed = selectOption(options, "inference_speed")
+		const model = selectOption(options, "model")
+		expect(speed.category).toBe("model_config")
+		expect(model.category).toBe("model")
 		expect(options.findIndex((option) => option.id === "provider")).toBeLessThan(
 			options.findIndex((option) => option.id === "model"),
 		)
