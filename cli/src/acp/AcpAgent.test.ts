@@ -653,6 +653,68 @@ describe("AcpAgent", () => {
 		expect(mocks.diracAgentInstance.recordClientAnnotation).toHaveBeenCalledWith({ sessionId: "session-1", annotation })
 	})
 
+	it.each([
+		false,
+		true,
+	])("adapts replayed and live config updates per transport (boolean support: %s)", async (supportsBoolean) => {
+		vi.useFakeTimers()
+		connection.sessionUpdate.mockResolvedValue(undefined)
+		const emitter = new EventEmitter()
+		mocks.diracAgentInstance.emitterForSession.mockReturnValue(emitter)
+		const option = Object.freeze({
+			id: "yolo",
+			name: "YOLO",
+			description: "Approval policy",
+			category: "mode",
+			type: "boolean",
+			currentValue: true,
+			_meta: { "test/option": "preserved" },
+		})
+		const select = Object.freeze({
+			id: "model",
+			name: "Model",
+			type: "select",
+			currentValue: "true",
+			options: [{ value: "true", name: "A model named true" }],
+		})
+		const configOptions = Object.freeze([option, select])
+		const update = Object.freeze({ sessionUpdate: "config_option_update", configOptions, _meta: { "dev.dirac/seq": 7 } })
+		mocks.diracAgentInstance.loadSession.mockResolvedValueOnce({ configOptions })
+		mocks.diracAgentInstance.replayLoadedSessionHistory.mockImplementationOnce(async () => {
+			emitter.emit("config_option_update", update)
+		})
+		const agent = new AcpAgent(connection, {})
+		await agent.initialize({
+			protocolVersion: 1,
+			clientCapabilities: supportsBoolean ? { session: { configOptions: { boolean: {} } } } : {},
+		})
+		const expectedOption = supportsBoolean
+			? option
+			: {
+					...option,
+					type: "select",
+					currentValue: "true",
+					options: [
+						{ value: "false", name: "Off" },
+						{ value: "true", name: "On" },
+					],
+				}
+		await expect(agent.loadSession({ sessionId: "session-1", cwd: "/tmp/workspace", mcpServers: [] })).resolves.toEqual({
+			configOptions: [expectedOption, select],
+		})
+		emitter.emit("config_option_update", update)
+		expect(connection.sessionUpdate).toHaveBeenCalledTimes(2)
+		for (const [notification] of connection.sessionUpdate.mock.calls) {
+			expect(notification).toEqual({
+				sessionId: "session-1",
+				update: { ...update, configOptions: [expectedOption, select] },
+			})
+		}
+		expect(option).toMatchObject({ type: "boolean", currentValue: true })
+		await vi.runAllTimersAsync()
+		agent.disconnect()
+	})
+
 	it("forwards client _meta without interpreting it", async () => {
 		mocks.diracAgentInstance.initialize.mockResolvedValue({ protocolVersion: 1, agentCapabilities: {}, agentInfo: {} })
 		const agent = new AcpAgent(connection, {})

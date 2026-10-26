@@ -80,6 +80,7 @@ export class AcpAgent implements acp.Agent {
 	private readonly sessionEventCleanup = new Map<string, Array<() => void>>()
 	/** A superseded detached transport must not continue serving RPCs. */
 	private disconnected = false
+	private supportsBooleanConfig = false
 
 	constructor(
 		connection: acp.AgentSideConnection,
@@ -129,6 +130,26 @@ export class AcpAgent implements acp.Agent {
 		}
 	}
 
+	/** Adapt at the transport boundary, including updates replayed from older sessions. */
+	private configOptionsForClient<T extends { configOptions?: acp.SessionConfigOption[] | null }>(response: T): T {
+		if (this.supportsBooleanConfig || !response.configOptions) return response
+		return {
+			...response,
+			configOptions: response.configOptions.map((option) => {
+				if (option.type !== "boolean") return option
+				return {
+					...option,
+					type: "select" as const,
+					currentValue: String(option.currentValue),
+					options: [
+						{ value: "false", name: "Off" },
+						{ value: "true", name: "On" },
+					],
+				}
+			}),
+		}
+	}
+
 	private subscribeToSessionEvents(sessionId: string): void {
 		if (this.subscribedSessions.has(sessionId)) {
 			return
@@ -146,7 +167,9 @@ export class AcpAgent implements acp.Agent {
 					sessionUpdate: eventName,
 					...payload,
 				} as acp.SessionUpdate
-				this.connection.sessionUpdate({ sessionId, update }).catch((error) => {
+				const clientUpdate =
+					update.sessionUpdate === "config_option_update" ? this.configOptionsForClient(update) : update
+				this.connection.sessionUpdate({ sessionId, update: clientUpdate }).catch((error) => {
 					Logger.error(`[AcpAgent] Error forwarding ${eventName}:`, error)
 				})
 			})
@@ -264,6 +287,7 @@ export class AcpAgent implements acp.Agent {
 
 	async initialize(params: acp.InitializeRequest): Promise<acp.InitializeResponse> {
 		this.assertConnected()
+		this.supportsBooleanConfig = params.clientCapabilities?.session?.configOptions?.boolean != null
 		return await this.diracAgent.initialize(params, this.connection)
 	}
 
@@ -351,7 +375,7 @@ export class AcpAgent implements acp.Agent {
 		// Subscribe to events for this new session
 		this.subscribeToSessionEvents(response.sessionId)
 		this.scheduleSessionSetupUpdates(response.sessionId)
-		return response
+		return this.configOptionsForClient(response)
 	}
 
 	async loadSession(params: acp.LoadSessionRequest): Promise<acp.LoadSessionResponse> {
@@ -361,7 +385,7 @@ export class AcpAgent implements acp.Agent {
 		// Replay history after subscribing so events reach the client
 		await this.diracAgent.replayLoadedSessionHistory(params.sessionId)
 		this.scheduleSessionSetupUpdates(params.sessionId)
-		return response
+		return this.configOptionsForClient(response)
 	}
 
 	async resumeSession(params: acp.ResumeSessionRequest): Promise<acp.ResumeSessionResponse> {
@@ -373,7 +397,7 @@ export class AcpAgent implements acp.Agent {
 		const response = await this.diracAgent.unstable_resumeSession(params)
 		this.subscribeToSessionEvents(params.sessionId)
 		this.scheduleSessionSetupUpdates(params.sessionId)
-		return response
+		return this.configOptionsForClient(response)
 	}
 
 	async unstable_forkSession(params: acp.ForkSessionRequest): Promise<acp.ForkSessionResponse> {
@@ -382,7 +406,7 @@ export class AcpAgent implements acp.Agent {
 		this.subscribeToSessionEvents(response.sessionId)
 		// Skip replayLoadedSessionHistory: per ACP spec, session/fork (like session/resume) does not stream historical chunks on fork.
 		this.scheduleSessionSetupUpdates(response.sessionId)
-		return response
+		return this.configOptionsForClient(response)
 	}
 
 	async listSessions(params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
@@ -462,7 +486,7 @@ export class AcpAgent implements acp.Agent {
 
 	async setSessionConfigOption(params: acp.SetSessionConfigOptionRequest): Promise<acp.SetSessionConfigOptionResponse> {
 		this.assertConnected()
-		return this.diracAgent.setSessionConfigOption(params)
+		return this.configOptionsForClient(await this.diracAgent.setSessionConfigOption(params))
 	}
 
 	async authenticate(params: acp.AuthenticateRequest): Promise<acp.AuthenticateResponse> {

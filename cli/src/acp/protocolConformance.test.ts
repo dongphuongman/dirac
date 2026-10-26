@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk"
+import { type ClientCapabilities, PROTOCOL_VERSION } from "@agentclientprotocol/sdk"
 import { afterEach, describe, expect, it } from "vitest"
 
 type JsonRpcFrame = {
@@ -45,11 +45,13 @@ class RawAcpClient {
 		})
 	}
 
-	async initialize(): Promise<JsonRpcFrame> {
-		return this.request("initialize", {
-			protocolVersion: PROTOCOL_VERSION,
-			clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
-		})
+	async initialize(
+		clientCapabilities: ClientCapabilities = {
+			fs: { readTextFile: true, writeTextFile: true },
+			session: { configOptions: { boolean: {} } },
+		},
+	): Promise<JsonRpcFrame> {
+		return this.request("initialize", { protocolVersion: PROTOCOL_VERSION, clientCapabilities })
 	}
 
 	request(method: string, params: Record<string, unknown>): Promise<JsonRpcFrame> {
@@ -155,6 +157,78 @@ describe("ACP protocol conformance over raw stdio", () => {
 
 		const initialized = await client.initialize()
 		expect(initialized.result).toMatchObject({ protocolVersion: PROTOCOL_VERSION })
+	})
+
+	it.each([
+		{ name: "missing session", capabilities: {} },
+		{ name: "missing configOptions", capabilities: { session: {} } },
+		{ name: "missing boolean", capabilities: { session: { configOptions: {} } } },
+		{ name: "null boolean", capabilities: { session: { configOptions: { boolean: null } } } },
+	])("uses select approval controls with $name capability", async ({ capabilities }) => {
+		const { client, cwd } = await createClient()
+		await client.initialize(capabilities)
+		const session = await client.request("session/new", { cwd, mcpServers: [] })
+		expect(session.error).toBeUndefined()
+		const sessionId = session.result?.sessionId as string
+		const assertControls = (result: Record<string, unknown> | undefined, autoApprove = "false", yolo = "false") => {
+			expect(result?.configOptions).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						id: "auto_approve",
+						type: "select",
+						currentValue: autoApprove,
+						options: [
+							{ value: "false", name: "Off" },
+							{ value: "true", name: "On" },
+						],
+					}),
+					expect.objectContaining({
+						id: "yolo",
+						type: "select",
+						currentValue: yolo,
+						options: [
+							{ value: "false", name: "Off" },
+							{ value: "true", name: "On" },
+						],
+					}),
+				]),
+			)
+		}
+		assertControls(session.result)
+		for (const [configId, value, autoApprove, yolo] of [
+			["auto_approve", "true", "true", "false"],
+			["yolo", "true", "true", "true"],
+			["auto_approve", "false", "false", "true"],
+			["yolo", "false", "false", "false"],
+		]) {
+			const configured = await client.request("session/set_config_option", { sessionId, configId, value })
+			expect(configured.error).toBeUndefined()
+			assertControls(configured.result, autoApprove, yolo)
+		}
+		for (const configId of ["auto_approve", "yolo"]) {
+			for (const value of ["", "yes", "TRUE", "1"]) {
+				const rejected = await client.request("session/set_config_option", { sessionId, configId, value })
+				expect(rejected.error).toBeDefined()
+			}
+		}
+		const plan = await client.request("session/set_config_option", { sessionId, configId: "mode", value: "plan" })
+		assertControls(plan.result)
+		expect(plan.result?.configOptions).toContainEqual(expect.objectContaining({ id: "mode", currentValue: "plan" }))
+		const act = await client.request("session/set_mode", { sessionId, modeId: "act" })
+		expect(act.error).toBeUndefined()
+		for (const method of ["session/load", "session/resume", "session/fork"]) {
+			const response = await client.request(method, { sessionId, cwd, mcpServers: [] })
+			expect(response.error).toBeUndefined()
+			assertControls(response.result)
+		}
+		await waitForUpdate(client, "config_option_update")
+		for (const frame of client.updates) {
+			const update = frame.params?.update as Record<string, unknown>
+			if (update.sessionUpdate !== "config_option_update") continue
+			expect((update.configOptions as Array<Record<string, unknown>>).every((option) => option.type !== "boolean")).toBe(
+				true,
+			)
+		}
 	})
 
 	it("round-trips config changes and emits a config update", async () => {

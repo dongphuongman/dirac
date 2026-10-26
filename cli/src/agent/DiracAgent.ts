@@ -101,7 +101,7 @@ import { ProviderConfigurationManager } from "./providerConfiguration.js"
 import type { DiracAcpSession, DiracAgentOptions, ElicitationHandler, PermissionHandler } from "./public-types.js"
 import { AcpSessionStatus } from "./public-types.js"
 import { ACP_REVIEW_COMMANDS, handleAcpReviewCommand } from "./review.js"
-import { type AcpModeId, SessionConfigManager } from "./sessionConfig.js"
+import { type AcpModeId, parseBooleanConfigValue, SessionConfigManager } from "./sessionConfig.js"
 import {
 	cloneForkedSessionArtifacts,
 	getHistoryItemCwd,
@@ -1674,12 +1674,10 @@ export class DiracAgent implements acp.Agent {
 
 			switch (params.configId) {
 				case "auto_approve":
-					if (typeof params.value !== "boolean") throw new Error("Auto-approve must be a boolean value")
-					nextOverrides.autoApproveAllToggled = params.value
+					nextOverrides.autoApproveAllToggled = parseBooleanConfigValue(params.value)
 					break
 				case "yolo":
-					if (typeof params.value !== "boolean") throw new Error("YOLO must be a boolean value")
-					nextOverrides.yoloModeToggled = params.value
+					nextOverrides.yoloModeToggled = parseBooleanConfigValue(params.value)
 					break
 				case "provider":
 					if (typeof params.value !== "string") throw new Error("Provider must be a select value")

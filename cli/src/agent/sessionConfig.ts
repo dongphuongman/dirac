@@ -33,6 +33,14 @@ import { getProviderLabel, getValidCliProviders, isValidCliProvider } from "../u
 import type { ProviderConfigurationManager } from "./providerConfiguration.js"
 import type { DiracAcpSession } from "./public-types.js"
 
+/** Accept native boolean controls and their explicit select fallback values, never truthiness. */
+export function parseBooleanConfigValue(value: string | boolean): boolean {
+	if (typeof value === "boolean") return value
+	if (value === "true") return true
+	if (value === "false") return false
+	throw new Error(`Invalid boolean config value: ${value}`)
+}
+
 /** ACP operating modes are mutually exclusive; approval qualifiers are separate booleans. */
 export type AcpModeId = Mode
 
